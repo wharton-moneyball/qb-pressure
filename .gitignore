@@ -1,3 +1,15 @@
+###########################
+### FILES & DIRECTORIES ###
+###########################
+
+# 2023 bdb tracking data
+data/bdb/week*.csv
+data/processed/bdb-tracking-all.parquet
+
+#########
+### R ###
+#########
+
 # History files
 .Rhistory
 .Rapp.history

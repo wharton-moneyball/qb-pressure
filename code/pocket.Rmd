@@ -16,9 +16,9 @@ library(zoo)
 Read in data
 ```{r}
 # Load data efficiently
-tracking_data <- read.csv('../data//big_data_bowl_2023_AllWeeks.csv') 
-plays <- read_csv("../data/plays.csv", show_col_types = FALSE)
-players <- read_csv("../data/players.csv", show_col_types = FALSE)
+tracking_data <- read.csv('data/processed/bdb-tracking-all.parquet') 
+plays <- read_csv("data/plays.csv", show_col_types = FALSE)
+players <- read_csv("data/players.csv", show_col_types = FALSE)
 
 ```
 
