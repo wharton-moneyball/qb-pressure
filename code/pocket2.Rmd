@@ -1,0 +1,272 @@
+---
+title: "Rolling Window Comparison"
+output: html_notebook
+---
+Setup
+
+
+
+Load in libraries
+
+```{r}
+library(tidyverse)
+library(deldir)
+library(nflfastR)
+library(zoo)
+library(ggrepel)
+library(arrow)
+```
+
+Read in data
+```{r}
+tracking_data <- read_parquet('data/processed/bdb-tracking-all.parquet')
+plays <- read_csv("data/plays.csv", show_col_types = FALSE)
+players <- read_csv("data/players.csv", show_col_types = FALSE)
+```
+
+Data cleaning
+```{r}
+tracking_data <- tracking_data %>%
+  filter(week %in% 1:5)
+
+tracking <- tracking_data %>%
+  left_join(players %>% select(nflId), by = "nflId")
+
+week_play_ids <- tracking %>% distinct(gameId, playId)
+```
+
+Core function — now accepts `k` for rolling window size
+```{r}
+relevant_positions <- c("QB", "OL", "DL", "LB", "TE", "CB", "S")
+
+# k: rolling window size (e.g. 3, 5, 7, 10)
+compute_qb_area <- function(play_data, k = 5) {
+  snap_vals    <- play_data$frameId[play_data$event == "ball_snap"]
+  release_vals <- play_data$frameId[play_data$event %in% c("pass_forward", "qb_sack", "qb_spike")]
+
+  if (length(snap_vals) == 0 || length(release_vals) == 0) {
+    return(tibble(qb = NA_character_, max_neg_change = NA_real_))
+  }
+
+  snap_frame    <- min(snap_vals,    na.rm = TRUE)
+  release_frame <- min(release_vals, na.rm = TRUE)
+
+  if (!is.finite(snap_frame) || !is.finite(release_frame)) {
+    return(tibble(qb = NA_character_, max_neg_change = NA_real_))
+  }
+
+  play_data <- play_data %>%
+    filter(frameId >= snap_frame, frameId <= release_frame)
+
+  qb_name <- play_data %>%
+    filter(officialPosition == "QB") %>%
+    distinct(displayName) %>%
+    pull() %>%
+    paste(collapse = "/")
+
+  frames <- unique(play_data$frameId)
+  # 需要至少 k+1 帧才能计算滚动均值
+  if (length(frames) < (k + 1)) {
+    return(tibble(qb = qb_name, max_neg_change = NA_real_))
+  }
+
+  qb_areas <- map_dfr(frames, function(f) {
+    frame_data <- play_data %>%
+      filter(frameId == f, !is.na(x), !is.na(y)) %>%
+      filter(officialPosition %in% relevant_positions) %>%
+      distinct(x, y, .keep_all = TRUE)
+
+    if (nrow(frame_data) < 3) return(tibble(frameId = f, qb_area = NA_real_))
+
+    tryCatch({
+      vor     <- deldir(frame_data$x, frame_data$y)
+      vor_df  <- vor$summary %>%
+        select(x, y, dir.area) %>%
+        left_join(frame_data, by = c("x", "y"))
+      qb_area <- vor_df %>%
+        filter(officialPosition == "QB") %>%
+        pull(dir.area)
+      tibble(frameId = f, qb_area = ifelse(length(qb_area) > 0, qb_area, NA_real_))
+    }, error = function(e) tibble(frameId = f, qb_area = NA_real_))
+  }) %>%
+    arrange(frameId) %>%
+    mutate(rate_change = c(NA, diff(qb_area)))
+
+  qb_areas <- qb_areas %>%
+    mutate(rolling_avg = suppressWarnings(
+      zoo::rollmean(rate_change, k = k, align = "left", fill = NA)
+    ))
+
+  max_neg <- suppressWarnings(min(qb_areas$rolling_avg, na.rm = TRUE))
+  if (!is.finite(max_neg)) max_neg <- NA_real_
+
+  tibble(qb = qb_name, max_neg_change = max_neg)
+}
+```
+
+Run for k = 3, 5, 7, 10 and combine
+```{r}
+window_sizes <- c(3, 5, 7, 10)
+
+all_summaries <- map_dfr(window_sizes, function(k) {
+  message("Computing rolling window k = ", k, " ...")
+  tracking %>%
+    group_by(gameId, playId) %>%
+    group_modify(~compute_qb_area(.x, k = k)) %>%
+    ungroup() %>%
+    mutate(window = as.factor(k))   # 记录是哪个窗口
+})
+```
+
+Merge with nflfastR
+```{r}
+pbp <- nflfastR::load_pbp(2021) %>%
+  mutate(playId = play_id) %>%
+  select(playId, yards_gained)
+
+plays_team <- plays %>% select(gameId, playId, possessionTeam)
+
+all_summaries <- all_summaries %>%
+  mutate(playId = as.numeric(playId)) %>%
+  left_join(pbp,        by = "playId") %>%
+  left_join(plays_team, by = c("gameId", "playId")) %>%
+  filter(!is.na(max_neg_change), !is.na(yards_gained))
+```
+
+---
+
+### 对比图1：散点图 — 四个窗口 PRSS vs yards_gained（facet）
+
+```{r}
+ggplot(all_summaries, aes(x = abs(max_neg_change), y = yards_gained)) +
+  geom_point(alpha = 0.3, color = "lightcoral", size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", size = 0.8) +
+  facet_wrap(~window, labeller = label_both) +
+  labs(
+    title = "PRSS vs Yards Gained — Rolling Window Comparison",
+    x = "PRSS (abs max neg change)",
+    y = "Yards Gained"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+### 对比图2：分箱回归线叠加对比
+
+```{r}
+binned_all <- all_summaries %>%
+  group_by(window) %>%
+  mutate(bin = cut(
+    abs(max_neg_change),
+    breaks = seq(0, max(abs(max_neg_change), na.rm = TRUE), by = 2)
+  )) %>%
+  group_by(window, bin) %>%
+  summarise(
+    avg_neg_change  = mean(abs(max_neg_change), na.rm = TRUE),
+    avg_yards_gained = mean(yards_gained, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(bin))
+
+ggplot(binned_all, aes(x = avg_neg_change, y = avg_yards_gained, color = window)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, size = 1) +
+  labs(
+    title = "Binned Avg Yards Gained vs Avg PRSS — All Windows Overlaid",
+    x = "Avg PRSS (per bin)",
+    y = "Avg Yards Gained",
+    color = "Rolling Window (k)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+### 对比图3：各窗口回归斜率 & R² 汇总
+
+```{r}
+model_stats <- all_summaries %>%
+  group_by(window) %>%
+  summarise(
+    r_squared   = summary(lm(yards_gained ~ abs(max_neg_change)))$r.squared,
+    slope       = coef(lm(yards_gained ~ abs(max_neg_change)))[2],
+    n_plays     = n(),
+    .groups = "drop"
+  )
+
+print(model_stats)
+
+# 可视化斜率
+ggplot(model_stats, aes(x = window, y = slope, fill = window)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = round(slope, 3)), vjust = -0.5, size = 4) +
+  labs(
+    title = "Regression Slope by Rolling Window Size",
+    x = "Rolling Window (k)",
+    y = "Slope (yards per unit PRSS)"
+  ) +
+  theme_minimal(base_size = 13)
+
+# 可视化 R²
+ggplot(model_stats, aes(x = window, y = r_squared, fill = window)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = round(r_squared, 4)), vjust = -0.5, size = 4) +
+  labs(
+    title = "R-Squared by Rolling Window Size",
+    x = "Rolling Window (k)",
+    y = "R²"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+### 对比图4：各窗口 PRSS 分布（密度图）
+
+```{r}
+# 了解不同k下PRSS值本身的分布差异
+ggplot(all_summaries, aes(x = abs(max_neg_change), fill = window, color = window)) +
+  geom_density(alpha = 0.25) +
+  labs(
+    title = "Distribution of PRSS by Rolling Window Size",
+    x = "PRSS",
+    y = "Density",
+    fill = "Window (k)",
+    color = "Window (k)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+### 对比图5：QB排名稳定性 — 不同窗口下QB均值排名是否一致？
+
+```{r}
+qb_by_window <- all_summaries %>%
+  group_by(window, qb) %>%
+  summarise(avg_prss = mean(abs(max_neg_change), na.rm = TRUE), .groups = "drop") %>%
+  group_by(window) %>%
+  mutate(prss_rank = rank(avg_prss)) %>%
+  ungroup()
+
+# 取出在所有窗口都出现的QB
+common_qbs <- qb_by_window %>%
+  count(qb) %>%
+  filter(n == length(window_sizes)) %>%
+  pull(qb)
+
+qb_by_window %>%
+  filter(qb %in% common_qbs) %>%
+  ggplot(aes(x = window, y = prss_rank, group = qb, color = qb)) +
+  geom_line(alpha = 0.5) +
+  geom_point(size = 2) +
+  labs(
+    title = "QB PRSS Rank Stability Across Rolling Windows",
+    x = "Rolling Window (k)",
+    y = "PRSS Rank (lower = less pressure)",
+    color = "QB"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")   # QB太多，隐藏图例
+```

@@ -18,3 +18,4 @@ write_parquet(tracking_all, "data/processed/bdb-tracking-all.parquet")
 
 # Print summary for confirmation
 glimpse(tracking_all)
+
