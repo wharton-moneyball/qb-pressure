@@ -1,48 +1,77 @@
 ---
-title: "Rolling Window Comparison"
+title: "QB Pocket Pressure Analysis (PRSS) — Rolling Window Comparison"
 output: html_notebook
 ---
-Setup
 
+## 1. 加载库
 
-
-Load in libraries
-
-```{r}
+```{r setup, message=FALSE, warning=FALSE}
 library(tidyverse)
+library(arrow)
 library(deldir)
 library(nflfastR)
 library(zoo)
 library(ggrepel)
-library(arrow)
 ```
 
-Read in data
-```{r}
-tracking_data <- read_parquet('data/processed/bdb-tracking-all.parquet')
-plays <- read_csv("data/plays.csv", show_col_types = FALSE)
-players <- read_csv("data/players.csv", show_col_types = FALSE)
+---
+
+## 2. 读取数据
+
+```{r load-data, message=FALSE}
+# BUG FIX: 原来用 read.csv() 读 parquet，应用 read_parquet()
+tracking_data <- read_parquet("../data/processed/bdb-tracking-all.parquet")
+
+plays   <- read_csv("../data/bdb/plays.csv",            show_col_types = FALSE)
+players <- read_csv("../data/bdb/players.csv",           show_col_types = FALSE)
+pff     <- read_csv("../data/bdb/pffScoutingData.csv",   show_col_types = FALSE)
+games <- read_csv("../data/bdb/games.csv", show_col_types = FALSE)
 ```
 
-Data cleaning
-```{r}
-tracking_data <- tracking_data %>%
-  filter(week %in% 1:5)
+---
 
+## 3. 数据清洗与合并
+
+```{r clean-data}
+tracking_data <- left_join(tracking_data, 
+                           games %>% select(gameId, week), 
+                           by = "gameId")
+
+# When nflId is NA, row corresponds to ball. (numeric)
 tracking <- tracking_data %>%
-  left_join(players %>% select(nflId), by = "nflId")
+  filter(!is.na(nflId)) %>%
+  left_join(
+    players %>% select(nflId, officialPosition, displayName),
+    by = "nflId"
+  )
 
-week_play_ids <- tracking %>% distinct(gameId, playId)
+# create 'real pressure' signals from pff
+# pff_hit / pff_hurry / pff_sack =1
+pff_pressure <- pff %>%
+  filter(pff_role == "Pass Rush") %>%
+  group_by(gameId, playId) %>%
+  summarise(
+    actual_pressure = as.integer(any(pff_hit == 1 | pff_hurry == 1 | pff_sack == 1, na.rm = TRUE)),
+    n_rushers       = n(),
+    .groups = "drop"
+  )
+
 ```
 
-Core function — now accepts `k` for rolling window size
-```{r}
+---
+
+## 4. 核心函数：计算 PRSS（Pocket Rate of Space Shrinkage）
+
+```{r define-function}
 relevant_positions <- c("QB", "OL", "DL", "LB", "TE", "CB", "S")
 
-# k: rolling window size (e.g. 3, 5, 7, 10)
-compute_qb_area <- function(play_data, k = 5) {
+# k: rolling window size
+compute_qb_area <- function(play_data, k) {
+
+  # Find the snap frame and the pass/ sack / spike frame
   snap_vals    <- play_data$frameId[play_data$event == "ball_snap"]
-  release_vals <- play_data$frameId[play_data$event %in% c("pass_forward", "qb_sack", "qb_spike")]
+  release_vals <- play_data$frameId[play_data$event %in%
+                    c("pass_forward", "qb_sack", "qb_spike")]
 
   if (length(snap_vals) == 0 || length(release_vals) == 0) {
     return(tibble(qb = NA_character_, max_neg_change = NA_real_))
@@ -58,6 +87,7 @@ compute_qb_area <- function(play_data, k = 5) {
   play_data <- play_data %>%
     filter(frameId >= snap_frame, frameId <= release_frame)
 
+  # QB name
   qb_name <- play_data %>%
     filter(officialPosition == "QB") %>%
     distinct(displayName) %>%
@@ -65,37 +95,42 @@ compute_qb_area <- function(play_data, k = 5) {
     paste(collapse = "/")
 
   frames <- unique(play_data$frameId)
+
   # 需要至少 k+1 帧才能计算滚动均值
   if (length(frames) < (k + 1)) {
     return(tibble(qb = qb_name, max_neg_change = NA_real_))
   }
 
+  # 逐帧计算QB的Voronoi面积
   qb_areas <- map_dfr(frames, function(f) {
     frame_data <- play_data %>%
-      filter(frameId == f, !is.na(x), !is.na(y)) %>%
-      filter(officialPosition %in% relevant_positions) %>%
+      filter(
+        frameId == f,
+        !is.na(x), !is.na(y),
+        officialPosition %in% relevant_positions
+      ) %>%
       distinct(x, y, .keep_all = TRUE)
 
     if (nrow(frame_data) < 3) return(tibble(frameId = f, qb_area = NA_real_))
 
     tryCatch({
-      vor     <- deldir(frame_data$x, frame_data$y)
-      vor_df  <- vor$summary %>%
+      vor    <- deldir(frame_data$x, frame_data$y)
+      vor_df <- vor$summary %>%
         select(x, y, dir.area) %>%
         left_join(frame_data, by = c("x", "y"))
       qb_area <- vor_df %>%
         filter(officialPosition == "QB") %>%
         pull(dir.area)
-      tibble(frameId = f, qb_area = ifelse(length(qb_area) > 0, qb_area, NA_real_))
+      tibble(frameId = f, qb_area = ifelse(length(qb_area) > 0, qb_area[1], NA_real_))
     }, error = function(e) tibble(frameId = f, qb_area = NA_real_))
   }) %>%
     arrange(frameId) %>%
-    mutate(rate_change = c(NA, diff(qb_area)))
-
-  qb_areas <- qb_areas %>%
-    mutate(rolling_avg = suppressWarnings(
-      zoo::rollmean(rate_change, k = k, align = "left", fill = NA)
-    ))
+    mutate(
+      rate_change = c(NA, diff(qb_area)),
+      rolling_avg = suppressWarnings(
+        zoo::rollmean(rate_change, k = k, align = "left", fill = NA)
+      )
+    )
 
   max_neg <- suppressWarnings(min(qb_areas$rolling_avg, na.rm = TRUE))
   if (!is.finite(max_neg)) max_neg <- NA_real_
@@ -104,57 +139,155 @@ compute_qb_area <- function(play_data, k = 5) {
 }
 ```
 
-Run for k = 3, 5, 7, 10 and combine
-```{r}
-window_sizes <- c(3, 5, 7, 10)
+---
 
-all_summaries <- map_dfr(window_sizes, function(k) {
-  message("Computing rolling window k = ", k, " ...")
-  tracking %>%
-    group_by(gameId, playId) %>%
-    group_modify(~compute_qb_area(.x, k = k)) %>%
-    ungroup() %>%
-    mutate(window = as.factor(k))   # 记录是哪个窗口
-})
+## 5. 对 k = 3, 5, 7, 10 批量计算
+
+```{r}
+play_list <- tracking %>%
+  group_by(gameId, playId) %>%
+  nest()
+
+results <- vector("list", nrow(play_list))
+
+for (i in seq_len(nrow(play_list))) {
+  if (i %% 100 == 0) message("Progress: ", i, "/", nrow(play_list))
+  results[[i]] <- compute_qb_area(play_list$data[[i]], k = 5)
+}
+
+all_summary_k5 <- bind_rows(results) %>%
+  bind_cols(play_list %>% select(gameId, playId))
+
+
+# 跑完立刻保存，防止丢失
+saveRDS(all_summary_k5, "../data/processed/all_summary_k5.rds")
+```
+```{r}
+final_data <- all_summary_k5 %>%
+  filter(!is.na(max_neg_change), !is.na(qb)) %>%
+  left_join(
+    plays %>% select(gameId, playId, possessionTeam, 
+                     passResult, prePenaltyPlayResult),
+    by = c("gameId", "playId")
+  ) %>%
+  left_join(pff_pressure, by = c("gameId", "playId"))
 ```
 
-Merge with nflfastR
 ```{r}
-pbp <- nflfastR::load_pbp(2021) %>%
-  mutate(playId = play_id) %>%
-  select(playId, yards_gained)
+# 画第一张图：PRSS 分布
+ggplot(final_data, aes(x = max_neg_change)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Distribution of PRSS (k=5)",
+    x = "PRSS (negative = pocket collapsing)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
 
-plays_team <- plays %>% select(gameId, playId, possessionTeam)
+```{r}
+# 画第二张图：PRSS vs playResult
+ggplot(final_data, aes(x = max_neg_change, y = prePenaltyPlayResult)) +
+  geom_point(alpha = 0.2, color = "lightcoral") +
+  geom_smooth(method = "lm", color = "black") +
+  labs(
+    title = "PRSS vs Play Result (yards gained)",
+    x = "PRSS",
+    y = "Yards Gained"
+  ) +
+  theme_minimal()
+
+# 简单相关性
+cor(final_data$max_neg_change, final_data$prePenaltyPlayResult, use = "complete.obs")
+```
+
+```{r}
+# k=5 已有，直接复用
+k5 <- all_summary_k5 %>% mutate(window = as.factor(5))
+
+# 只跑 k=3, 7, 10
+window_sizes <- c(3, 7, 10)
+all_results <- vector("list", length(window_sizes))
+
+for (w in seq_along(window_sizes)) {
+  k <- window_sizes[w]
+  message("Computing k = ", k, " ...")
+  
+  results_k <- vector("list", nrow(play_list))
+  for (i in seq_len(nrow(play_list))) {
+    if (i %% 500 == 0) message("  k=", k, " Progress: ", i, "/", nrow(play_list))
+    results_k[[i]] <- compute_qb_area(play_list$data[[i]], k = k)
+  }
+  
+  all_results[[w]] <- play_list %>%
+    select(gameId, playId) %>%
+    bind_cols(bind_rows(results_k)) %>%
+    mutate(window = as.factor(k))
+}
+
+# 合并所有窗口包括k=5
+all_summaries <- bind_rows(all_results) %>%
+  bind_rows(k5)
+
+saveRDS(all_summaries, "../data/processed/all_summaries_all_windows.rds")
+```
+
+
+
+
+
+---
+
+## 6. 合并外部数据
+
+```{r merge-data, message=FALSE}
+# BUG FIX: 原来只用 playId join，但 playId 跨 gameId 不唯一
+# 必须用 gameId + playId 联合 join
+# nflfastR 字段名是 game_id / play_id，需要先重命名
+pbp <- nflfastR::load_pbp(2021) %>%
+  mutate(
+    gameId = as.numeric(game_id),
+    playId = as.numeric(play_id)
+  ) %>%
+  select(gameId, playId, yards_gained)
 
 all_summaries <- all_summaries %>%
-  mutate(playId = as.numeric(playId)) %>%
-  left_join(pbp,        by = "playId") %>%
-  left_join(plays_team, by = c("gameId", "playId")) %>%
+  mutate(
+    gameId = as.numeric(gameId),
+    playId = as.numeric(playId)
+  ) %>%
+  # BUG FIX: 用 gameId + playId 联合 join
+  left_join(pbp,         by = c("gameId", "playId")) %>%
+  left_join(plays_clean, by = c("gameId", "playId")) %>%
+  left_join(pff_pressure,by = c("gameId", "playId")) %>%
   filter(!is.na(max_neg_change), !is.na(yards_gained))
 ```
 
 ---
 
-### 对比图1：散点图 — 四个窗口 PRSS vs yards_gained（facet）
+## 7. 可视化对比
 
-```{r}
+### 图1：四个窗口 PRSS vs yards_gained（Facet 散点图）
+
+```{r plot-scatter-facet}
 ggplot(all_summaries, aes(x = abs(max_neg_change), y = yards_gained)) +
   geom_point(alpha = 0.3, color = "lightcoral", size = 0.8) +
-  geom_smooth(method = "lm", se = TRUE, color = "black", size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
   facet_wrap(~window, labeller = label_both) +
   labs(
     title = "PRSS vs Yards Gained — Rolling Window Comparison",
-    x = "PRSS (abs max neg change)",
-    y = "Yards Gained"
+    x     = "PRSS (abs max neg change)",
+    y     = "Yards Gained"
   ) +
   theme_minimal(base_size = 13)
 ```
 
 ---
 
-### 对比图2：分箱回归线叠加对比
+### 图2：分箱回归线叠加（四条线放在一张图）
 
-```{r}
+```{r plot-binned-overlay}
 binned_all <- all_summaries %>%
   group_by(window) %>%
   mutate(bin = cut(
@@ -163,76 +296,73 @@ binned_all <- all_summaries %>%
   )) %>%
   group_by(window, bin) %>%
   summarise(
-    avg_neg_change  = mean(abs(max_neg_change), na.rm = TRUE),
-    avg_yards_gained = mean(yards_gained, na.rm = TRUE),
+    avg_neg_change   = mean(abs(max_neg_change), na.rm = TRUE),
+    avg_yards_gained = mean(yards_gained,        na.rm = TRUE),
     .groups = "drop"
   ) %>%
   filter(!is.na(bin))
 
 ggplot(binned_all, aes(x = avg_neg_change, y = avg_yards_gained, color = window)) +
   geom_point(alpha = 0.5, size = 1.5) +
-  geom_smooth(method = "lm", se = FALSE, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
   labs(
-    title = "Binned Avg Yards Gained vs Avg PRSS — All Windows Overlaid",
-    x = "Avg PRSS (per bin)",
-    y = "Avg Yards Gained",
-    color = "Rolling Window (k)"
+    title  = "Binned Avg Yards Gained vs Avg PRSS — All Windows Overlaid",
+    x      = "Avg PRSS (per bin)",
+    y      = "Avg Yards Gained",
+    color  = "Rolling Window (k)"
   ) +
   theme_minimal(base_size = 13)
 ```
 
 ---
 
-### 对比图3：各窗口回归斜率 & R² 汇总
+### 图3：各窗口回归斜率 & R² 对比
 
-```{r}
+```{r plot-model-stats}
 model_stats <- all_summaries %>%
   group_by(window) %>%
   summarise(
-    r_squared   = summary(lm(yards_gained ~ abs(max_neg_change)))$r.squared,
-    slope       = coef(lm(yards_gained ~ abs(max_neg_change)))[2],
-    n_plays     = n(),
-    .groups = "drop"
+    r_squared = summary(lm(yards_gained ~ abs(max_neg_change)))$r.squared,
+    slope     = coef(lm(yards_gained ~ abs(max_neg_change)))[2],
+    n_plays   = n(),
+    .groups   = "drop"
   )
 
 print(model_stats)
 
-# 可视化斜率
 ggplot(model_stats, aes(x = window, y = slope, fill = window)) +
   geom_col(width = 0.5, show.legend = FALSE) +
   geom_text(aes(label = round(slope, 3)), vjust = -0.5, size = 4) +
   labs(
     title = "Regression Slope by Rolling Window Size",
-    x = "Rolling Window (k)",
-    y = "Slope (yards per unit PRSS)"
+    x     = "Rolling Window (k)",
+    y     = "Slope (yards per unit PRSS)"
   ) +
   theme_minimal(base_size = 13)
 
-# 可视化 R²
 ggplot(model_stats, aes(x = window, y = r_squared, fill = window)) +
   geom_col(width = 0.5, show.legend = FALSE) +
   geom_text(aes(label = round(r_squared, 4)), vjust = -0.5, size = 4) +
   labs(
     title = "R-Squared by Rolling Window Size",
-    x = "Rolling Window (k)",
-    y = "R²"
+    x     = "Rolling Window (k)",
+    y     = "R²"
   ) +
   theme_minimal(base_size = 13)
 ```
 
 ---
 
-### 对比图4：各窗口 PRSS 分布（密度图）
+### 图4：PRSS 分布密度图（k 越大分布越平滑）
 
-```{r}
-# 了解不同k下PRSS值本身的分布差异
+```{r plot-density}
 ggplot(all_summaries, aes(x = abs(max_neg_change), fill = window, color = window)) +
   geom_density(alpha = 0.25) +
   labs(
     title = "Distribution of PRSS by Rolling Window Size",
-    x = "PRSS",
-    y = "Density",
-    fill = "Window (k)",
+    x     = "PRSS",
+    y     = "Density",
+    fill  = "Window (k)",
     color = "Window (k)"
   ) +
   theme_minimal(base_size = 13)
@@ -240,17 +370,18 @@ ggplot(all_summaries, aes(x = abs(max_neg_change), fill = window, color = window
 
 ---
 
-### 对比图5：QB排名稳定性 — 不同窗口下QB均值排名是否一致？
+### 图5：QB排名稳定性（不同k下排名变化幅度）
 
-```{r}
+```{r plot-qb-rank-stability}
 qb_by_window <- all_summaries %>%
+  filter(!is.na(qb), qb != "") %>%
   group_by(window, qb) %>%
   summarise(avg_prss = mean(abs(max_neg_change), na.rm = TRUE), .groups = "drop") %>%
   group_by(window) %>%
   mutate(prss_rank = rank(avg_prss)) %>%
   ungroup()
 
-# 取出在所有窗口都出现的QB
+# 只保留在所有窗口都出现的QB
 common_qbs <- qb_by_window %>%
   count(qb) %>%
   filter(n == length(window_sizes)) %>%
@@ -263,10 +394,68 @@ qb_by_window %>%
   geom_point(size = 2) +
   labs(
     title = "QB PRSS Rank Stability Across Rolling Windows",
-    x = "Rolling Window (k)",
-    y = "PRSS Rank (lower = less pressure)",
+    x     = "Rolling Window (k)",
+    y     = "PRSS Rank (lower = less pressure faced)",
     color = "QB"
   ) +
   theme_minimal(base_size = 12) +
-  theme(legend.position = "none")   # QB太多，隐藏图例
+  theme(legend.position = "none")
+```
+
+---
+
+### 图6：PRSS 指标验证 — 与真实压力事件对比（pffScoutingData）
+
+```{r plot-validation}
+# 用 actual_pressure（pff真实标注）验证PRSS是否有效
+# 若PRSS有意义，actual_pressure=1的play应有更高PRSS
+validation_data <- all_summaries %>%
+  filter(!is.na(actual_pressure), window == 5)  # 用k=5做验证
+
+ggplot(validation_data,
+       aes(x = factor(actual_pressure, labels = c("No Pressure", "Pressure")),
+           y = abs(max_neg_change),
+           fill = factor(actual_pressure))) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(
+    title = "PRSS Distribution: Actual Pressure vs No Pressure (k=5)",
+    x     = "PFF Pressure Label",
+    y     = "PRSS"
+  ) +
+  theme_minimal(base_size = 13)
+
+# t检验：两组均值是否显著不同
+t_result <- t.test(
+  abs(max_neg_change) ~ actual_pressure,
+  data = validation_data
+)
+print(t_result)
+```
+
+---
+
+### 图7：球队 PRSS 排名（k=5）
+
+```{r plot-team-prss}
+team_summary <- all_summaries %>%
+  filter(window == 5, !is.na(possessionTeam)) %>%
+  group_by(possessionTeam) %>%
+  summarise(
+    avg_prss  = mean(abs(max_neg_change), na.rm = TRUE),
+    avg_yards = mean(yards_gained,        na.rm = TRUE),
+    n_plays   = n(),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(avg_prss))
+
+ggplot(team_summary, aes(x = reorder(possessionTeam, avg_prss), y = avg_prss)) +
+  geom_col(fill = "tomato", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title = "Avg PRSS by Offensive Team (k=5, Weeks 1-5)",
+    x     = "Team",
+    y     = "Avg PRSS (higher = more pocket collapse)"
+  ) +
+  theme_minimal(base_size = 12)
 ```
