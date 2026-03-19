@@ -1,0 +1,298 @@
+---
+title: "QB Pocket Area Distribution Over Time Since Snap"
+output: html_notebook
+---
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(arrow)
+library(deldir)
+library(zoo)
+```
+
+---
+
+## Load Data
+
+```{r load-data, message=FALSE}
+tracking_data <- read_parquet("../data/processed/bdb-tracking-all.parquet")
+
+players <- read_csv("../data/bdb/players.csv", show_col_types = FALSE)
+games   <- read_csv("../data/bdb/games.csv",   show_col_types = FALSE)
+
+tracking_data <- left_join(tracking_data,
+                           games %>% select(gameId, week),
+                           by = "gameId")
+
+tracking <- tracking_data %>%
+  filter(!is.na(nflId)) %>%
+  left_join(
+    players %>% select(nflId, officialPosition, displayName),
+    by = "nflId"
+  )
+```
+
+---
+
+## Sample Plays
+
+To keep computation manageable, we sample plays that have both a
+`ball_snap` and a `pass_forward` / `qb_sack` / `qb_spike` event.
+
+```{r sample-plays}
+set.seed(42)
+
+valid_plays <- tracking %>%
+  group_by(gameId, playId) %>%
+  summarise(
+    has_snap    = any(event == "ball_snap",                                   na.rm = TRUE),
+    has_release = any(event %in% c("pass_forward", "qb_sack", "qb_spike"),   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(has_snap, has_release)
+
+# Sample 500 plays for speed; increase if needed
+sampled_plays <- valid_plays %>% slice_sample(n = 500)
+
+cat("Sampled plays:", nrow(sampled_plays), "\n")
+```
+
+---
+
+## Compute Frame-by-Frame QB Area (time indexed from snap)
+
+```{r compute-areas, message=FALSE, warning=FALSE}
+relevant_positions <- c("QB", "OL", "DL", "LB", "TE", "CB", "S")
+
+get_area_vs_time <- function(game_id, play_id) {
+  play_data <- tracking %>%
+    filter(gameId == game_id, playId == play_id)
+
+  snap_frame    <- min(play_data$frameId[play_data$event == "ball_snap"],    na.rm = TRUE)
+  release_frame <- min(play_data$frameId[play_data$event %in%
+                         c("pass_forward", "qb_sack", "qb_spike")],         na.rm = TRUE)
+
+  if (!is.finite(snap_frame) || !is.finite(release_frame)) return(NULL)
+
+  play_data <- play_data %>%
+    filter(frameId >= snap_frame, frameId <= release_frame,
+           officialPosition %in% relevant_positions,
+           !is.na(x), !is.na(y))
+
+  frames <- unique(play_data$frameId)
+
+  map_dfr(frames, function(f) {
+    frame_data <- play_data %>%
+      filter(frameId == f) %>%
+      distinct(x, y, .keep_all = TRUE)
+
+    if (nrow(frame_data) < 3) return(NULL)
+
+    tryCatch({
+      vor    <- deldir(frame_data$x, frame_data$y)
+      vor_df <- vor$summary %>%
+        select(x, y, dir.area) %>%
+        left_join(frame_data, by = c("x", "y"))
+      qb_area <- vor_df %>%
+        filter(officialPosition == "QB") %>%
+        pull(dir.area)
+      if (length(qb_area) == 0) return(NULL)
+      tibble(
+        gameId          = game_id,
+        playId          = play_id,
+        frames_since_snap = f - snap_frame,   # 0 = snap frame
+        qb_area         = qb_area[1]
+      )
+    }, error = function(e) NULL)
+  })
+}
+
+# Run — progress message every 100 plays
+area_vs_time <- imap_dfr(seq_len(nrow(sampled_plays)), function(i, ...) {
+  if (i %% 100 == 0) message("Progress: ", i, "/", nrow(sampled_plays))
+  get_area_vs_time(sampled_plays$gameId[i], sampled_plays$playId[i])
+})
+
+cat("Total frame-play rows:", nrow(area_vs_time), "\n")
+```
+
+---
+
+## Convert Frames to Seconds
+
+Tracking data is recorded at **10 fps**, so 1 frame = 0.1 seconds.
+
+```{r add-seconds}
+area_vs_time <- area_vs_time %>%
+  mutate(
+    seconds_since_snap = frames_since_snap / 10,
+    # bin to nearest 0.1 s (= 1 frame); coarser bin for boxplot
+    second_bin = round(seconds_since_snap, 1)
+  )
+
+cat("Max time window observed:", max(area_vs_time$seconds_since_snap), "seconds\n")
+```
+
+---
+
+## Plot 1: Median QB Area Over Time (with IQR ribbon)
+
+```{r plot-median, fig.width=10, fig.height=5}
+area_summary <- area_vs_time %>%
+  group_by(second_bin) %>%
+  summarise(
+    n      = n(),
+    median = median(qb_area, na.rm = TRUE),
+    q25    = quantile(qb_area, 0.25, na.rm = TRUE),
+    q75    = quantile(qb_area, 0.75, na.rm = TRUE),
+    q10    = quantile(qb_area, 0.10, na.rm = TRUE),
+    q90    = quantile(qb_area, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 20)   # drop bins with very few plays (late in long plays)
+
+ggplot(area_summary, aes(x = second_bin)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90), fill = "steelblue", alpha = 0.15) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), fill = "steelblue", alpha = 0.30) +
+  geom_line(aes(y = median), color = "steelblue", linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgreen") +
+  annotate("text", x = 0.05, y = Inf, label = "snap", vjust = 1.5,
+           color = "darkgreen", size = 3.5) +
+  labs(
+    title    = "QB Voronoi Area Over Time Since Snap",
+    subtitle = "Line = median | Inner band = IQR | Outer band = 10th–90th percentile",
+    x = "Seconds since snap",
+    y = "QB Voronoi Area (sq yards)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## Plot 2: Boxplot Distribution at Each Second (binned by 0.5s)
+
+```{r plot-boxplot, fig.width=11, fig.height=5}
+area_vs_time %>%
+  mutate(half_second_bin = round(seconds_since_snap * 2) / 2) %>%  # bin to 0.5s
+  group_by(half_second_bin) %>%
+  filter(n() >= 20) %>%
+  ungroup() %>%
+  ggplot(aes(x = factor(half_second_bin), y = qb_area)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray50") +
+  labs(
+    title    = "Distribution of QB Voronoi Area by Time Since Snap (0.5s bins)",
+    subtitle = "Each box = all plays at that time point",
+    x = "Seconds since snap",
+    y = "QB Voronoi Area (sq yards)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+## Plot 3: Median Rate of Change Over Time
+
+Does the pocket expand first then collapse? This shows the frame-to-frame
+change in QB area, averaged across all plays.
+
+```{r plot-rate-of-change, fig.width=10, fig.height=5}
+rate_summary <- area_vs_time %>%
+  arrange(gameId, playId, frames_since_snap) %>%
+  group_by(gameId, playId) %>%
+  mutate(area_change = qb_area - lag(qb_area)) %>%
+  ungroup() %>%
+  filter(!is.na(area_change)) %>%
+  group_by(second_bin) %>%
+  summarise(
+    n           = n(),
+    median_rate = median(area_change, na.rm = TRUE),
+    q25         = quantile(area_change, 0.25, na.rm = TRUE),
+    q75         = quantile(area_change, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 20)
+
+ggplot(rate_summary, aes(x = second_bin)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), fill = "tomato", alpha = 0.25) +
+  geom_line(aes(y = median_rate), color = "tomato", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgreen") +
+  annotate("text", x = 0.05, y = Inf, label = "snap", vjust = 1.5,
+           color = "darkgreen", size = 3.5) +
+  labs(
+    title    = "Median Frame-to-Frame Change in QB Area Over Time",
+    subtitle = "Above 0 = pocket expanding | Below 0 = pocket collapsing | Band = IQR",
+    x = "Seconds since snap",
+    y = "Change in QB Area (sq yards / frame)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## Plot 4: % of Plays Where Pocket is Still Expanding at Each Time Point
+
+```{r plot-pct-expanding, fig.width=10, fig.height=5}
+area_vs_time %>%
+  arrange(gameId, playId, frames_since_snap) %>%
+  group_by(gameId, playId) %>%
+  mutate(area_change = qb_area - lag(qb_area)) %>%
+  ungroup() %>%
+  filter(!is.na(area_change)) %>%
+  group_by(second_bin) %>%
+  summarise(
+    n             = n(),
+    pct_expanding = mean(area_change > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 20) %>%
+  ggplot(aes(x = second_bin, y = pct_expanding)) +
+  geom_line(color = "purple", linewidth = 1.2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0,   linetype = "dashed", color = "darkgreen") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title    = "% of Plays Where QB Area is Still Expanding at Each Time Point",
+    subtitle = "Above 50% = more plays expanding than collapsing at that moment",
+    x = "Seconds since snap",
+    y = "% of plays with expanding pocket"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## Key Question: Does the pocket systematically expand right after snap?
+
+If Plot 3 shows **positive median rate change in the first ~0.5s**, and
+Plot 4 shows **> 50% of plays expanding** in that window, it confirms
+Lucian's hypothesis — the dropback itself is driving the positive PRSS values,
+and the snap frame is too early a start point.
+
+A potential fix would be to **delay the window start** by a fixed offset
+(e.g. 5 frames / 0.5s after snap) to skip the dropback phase.
+
+```{r dropback-offset-check}
+# What % of plays have positive area change in frames 1-5 after snap?
+area_vs_time %>%
+  arrange(gameId, playId, frames_since_snap) %>%
+  group_by(gameId, playId) %>%
+  mutate(area_change = qb_area - lag(qb_area)) %>%
+  ungroup() %>%
+  filter(!is.na(area_change)) %>%
+  mutate(phase = case_when(
+    frames_since_snap <= 5  ~ "Early (0–0.5s)",
+    frames_since_snap <= 15 ~ "Mid   (0.5–1.5s)",
+    TRUE                    ~ "Late  (>1.5s)"
+  )) %>%
+  group_by(phase) %>%
+  summarise(
+    n             = n(),
+    pct_expanding = scales::percent(mean(area_change > 0, na.rm = TRUE), accuracy = 0.1),
+    median_change = round(median(area_change, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+```
