@@ -1,0 +1,6 @@
+play_rank,gameId,playId,qb,max_neg_change,video_path
+1,2021103104,2033,Jalen Hurts,-42.6430676,/Users/Jonathan/wsabi/seminar/projects/prss/data/processed/prss_play_videos/play_01_g2021103104_p2033.mp4
+2,2021100305,2929,Kirk Cousins,-34.20389159999999,/Users/Jonathan/wsabi/seminar/projects/prss/data/processed/prss_play_videos/play_02_g2021100305_p2929.mp4
+3,2021101001,1602,Jalen Hurts,-28.665675,/Users/Jonathan/wsabi/seminar/projects/prss/data/processed/prss_play_videos/play_03_g2021101001_p1602.mp4
+4,2021093000,599,Trevor Lawrence,-27.983778600000004,/Users/Jonathan/wsabi/seminar/projects/prss/data/processed/prss_play_videos/play_04_g2021093000_p599.mp4
+5,2021101013,1983,Patrick Mahomes,-27.7686822,/Users/Jonathan/wsabi/seminar/projects/prss/data/processed/prss_play_videos/play_05_g2021101013_p1983.mp4

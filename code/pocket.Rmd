@@ -7,18 +7,19 @@ Load in libraries
 
 ```{r}
 library(tidyverse)
+library(arrow)
 library(deldir)
 library(nflfastR)
-install.packages('zoo')
 library(zoo)
 ```
 
 Read in data
 ```{r}
 # Load data efficiently
-tracking_data <- read.csv('data/processed/bdb-tracking-all.parquet') 
-plays <- read_csv("data/plays.csv", show_col_types = FALSE)
-players <- read_csv("data/players.csv", show_col_types = FALSE)
+tracking_data <- read_parquet('../data/processed/bdb-tracking-all.parquet') 
+plays <- read_csv("../data/bdb/plays.csv", show_col_types = FALSE)
+players <- read_csv("../data/bdb/players.csv", show_col_types = FALSE)
+pff <- read_csv("../data/bdb/pffScoutingData.csv", show_col_types = FALSE)
 
 ```
 
@@ -29,16 +30,126 @@ tracking_data <- tracking_data %>%
   filter(week %in% 1:5)
 
 tracking <- tracking_data %>%
-  left_join(players %>% select(nflId), by = "nflId")
+  left_join(players %>% select(nflId, officialPosition, displayName), by = "nflId")
+
+pff_pocket_ids <- pff %>%
+  filter(pff_role %in% c("Pass Block", "Pass Rush"), !is.na(nflId)) %>%
+  distinct(gameId, playId, nflId) %>%
+  group_by(gameId, playId) %>%
+  summarise(pocket_ids = list(unique(nflId)), .groups = "drop")
 
 week_play_ids <- tracking %>% distinct(gameId, playId)
 ```
 
 Filter
 ```{r}
-relevant_positions <- c("QB", "OL", "DL", "LB", "TE", "CB", "S")
+fallback_positions <- c(
+  "QB", "C", "G", "T", "TE", "FB", "RB", "WR",
+  "DE", "DT", "NT", "ILB", "OLB", "MLB", "LB",
+  "CB", "DB", "FS", "SS"
+)
+back_cap_yards <- 3
+side_cap_yards <- 3
 
-compute_qb_area <- function(play_data) {
+poly_area <- function(x, y) {
+  if (length(x) < 3 || length(y) < 3) return(NA_real_)
+  x2 <- c(x, x[1])
+  y2 <- c(y, y[1])
+  abs(sum(x2[-1] * y2[-length(y2)] - x2[-length(x2)] * y2[-1])) / 2
+}
+
+clip_polygon <- function(x, y, inside_fn, intersect_fn) {
+  n <- length(x)
+  if (n < 3) return(list(x = numeric(0), y = numeric(0)))
+
+  out_x <- numeric(0)
+  out_y <- numeric(0)
+
+  for (i in seq_len(n)) {
+    j <- if (i == 1) n else i - 1
+    x1 <- x[j]; y1 <- y[j]
+    x2 <- x[i]; y2 <- y[i]
+    in1 <- inside_fn(x1, y1)
+    in2 <- inside_fn(x2, y2)
+
+    if (in2) {
+      if (!in1) {
+        p <- intersect_fn(x1, y1, x2, y2)
+        out_x <- c(out_x, p[1]); out_y <- c(out_y, p[2])
+      }
+      out_x <- c(out_x, x2); out_y <- c(out_y, y2)
+    } else if (in1) {
+      p <- intersect_fn(x1, y1, x2, y2)
+      out_x <- c(out_x, p[1]); out_y <- c(out_y, p[2])
+    }
+  }
+
+  list(x = out_x, y = out_y)
+}
+
+clip_xmin <- function(x, y, xmin) {
+  clip_polygon(
+    x, y,
+    inside_fn = function(px, py) px >= xmin,
+    intersect_fn = function(x1, y1, x2, y2) {
+      dx <- x2 - x1
+      t <- if (abs(dx) < 1e-12) 0 else (xmin - x1) / dx
+      c(xmin, y1 + t * (y2 - y1))
+    }
+  )
+}
+
+clip_xmax <- function(x, y, xmax) {
+  clip_polygon(
+    x, y,
+    inside_fn = function(px, py) px <= xmax,
+    intersect_fn = function(x1, y1, x2, y2) {
+      dx <- x2 - x1
+      t <- if (abs(dx) < 1e-12) 0 else (xmax - x1) / dx
+      c(xmax, y1 + t * (y2 - y1))
+    }
+  )
+}
+
+clip_ymin <- function(x, y, ymin) {
+  clip_polygon(
+    x, y,
+    inside_fn = function(px, py) py >= ymin,
+    intersect_fn = function(x1, y1, x2, y2) {
+      dy <- y2 - y1
+      t <- if (abs(dy) < 1e-12) 0 else (ymin - y1) / dy
+      c(x1 + t * (x2 - x1), ymin)
+    }
+  )
+}
+
+clip_ymax <- function(x, y, ymax) {
+  clip_polygon(
+    x, y,
+    inside_fn = function(px, py) py <= ymax,
+    intersect_fn = function(x1, y1, x2, y2) {
+      dy <- y2 - y1
+      t <- if (abs(dy) < 1e-12) 0 else (ymax - y1) / dy
+      c(x1 + t * (x2 - x1), ymax)
+    }
+  )
+}
+
+clip_qb_polygon <- function(x, y, qb_x, qb_y, play_dir, back_cap, side_cap) {
+  out <- list(x = x, y = y)
+  dir <- tolower(as.character(play_dir))
+
+  if (is.finite(qb_x) && dir == "right") out <- clip_xmin(out$x, out$y, qb_x - back_cap)
+  if (is.finite(qb_x) && dir == "left")  out <- clip_xmax(out$x, out$y, qb_x + back_cap)
+
+  if (is.finite(qb_y)) {
+    out <- clip_ymin(out$x, out$y, qb_y - side_cap)
+    out <- clip_ymax(out$x, out$y, qb_y + side_cap)
+  }
+  out
+}
+
+compute_qb_area <- function(play_data, pocket_ids = NULL) {
   snap_vals <- play_data$frameId[play_data$event == "ball_snap"]
   release_vals <- play_data$frameId[play_data$event %in% c("pass_forward", "qb_sack", "qb_spike")]
 
@@ -50,6 +161,9 @@ compute_qb_area <- function(play_data) {
   release_frame <- min(release_vals, na.rm = TRUE)
 
   if (!is.finite(snap_frame) || !is.finite(release_frame)) {
+    return(tibble(qb = NA_character_, max_neg_change = NA_real_))
+  }
+  if (release_frame < snap_frame) {
     return(tibble(qb = NA_character_, max_neg_change = NA_real_))
   }
 
@@ -68,22 +182,52 @@ compute_qb_area <- function(play_data) {
   }
 
   qb_areas <- map_dfr(frames, function(f) {
-    frame_data <- play_data %>%
-      filter(frameId == f, !is.na(x), !is.na(y)) %>%
-      filter(officialPosition %in% relevant_positions) %>%
-      distinct(x, y, .keep_all = TRUE)
+    cleaned_ids <- unique(pocket_ids[!is.na(pocket_ids)])
+    has_pff_ids <- length(cleaned_ids) > 0
+
+    frame_data <- if (has_pff_ids) {
+      play_data %>%
+        filter(frameId == f, !is.na(x), !is.na(y)) %>%
+        filter(officialPosition == "QB" | nflId %in% cleaned_ids) %>%
+        distinct(x, y, .keep_all = TRUE) %>%
+        mutate(ptNum = row_number())
+    } else {
+      play_data %>%
+        filter(frameId == f, !is.na(x), !is.na(y)) %>%
+        filter(officialPosition %in% fallback_positions) %>%
+        distinct(x, y, .keep_all = TRUE) %>%
+        mutate(ptNum = row_number())
+    }
 
     if (nrow(frame_data) < 3) return(tibble(frameId = f, qb_area = NA_real_))
 
     tryCatch({
-      vor <- deldir(frame_data$x, frame_data$y)
-      vor_df <- vor$summary %>%
-        select(x, y, dir.area) %>%
-        left_join(frame_data, by = c("x", "y"))
-      qb_area <- vor_df %>%
+      qb_seed <- frame_data %>%
         filter(officialPosition == "QB") %>%
-        pull(dir.area)
-      tibble(frameId = f, qb_area = ifelse(length(qb_area) > 0, qb_area, NA_real_))
+        slice(1)
+      if (nrow(qb_seed) == 0) return(tibble(frameId = f, qb_area = NA_real_))
+
+      qb_x_seed <- qb_seed$x[[1]]
+      qb_y_seed <- qb_seed$y[[1]]
+      play_dir <- tolower(as.character(qb_seed$playDirection[[1]]))
+      vor <- deldir(frame_data$x, frame_data$y, rw = c(0, 120, 0, 53.3))
+      tiles <- tile.list(vor)
+      idx <- qb_seed$ptNum[[1]]
+      if (!is.finite(idx) || idx < 1 || idx > length(tiles)) {
+        return(tibble(frameId = f, qb_area = NA_real_))
+      }
+
+      tile <- tiles[[idx]]
+      capped <- clip_qb_polygon(
+        tile$x, tile$y,
+        qb_x = qb_x_seed,
+        qb_y = qb_y_seed,
+        play_dir = play_dir,
+        back_cap = back_cap_yards,
+        side_cap = side_cap_yards
+      )
+      qb_area <- poly_area(capped$x, capped$y)
+      tibble(frameId = f, qb_area = ifelse(is.finite(qb_area), qb_area, NA_real_))
     }, error = function(e) tibble(frameId = f, qb_area = NA_real_))
   }) %>%
     arrange(frameId) %>%
@@ -103,8 +247,11 @@ Compute
 ```{r}
 five_weeks_summary <- tracking %>%
   group_by(gameId, playId) %>%
-  group_modify(~compute_qb_area(.x)) %>%
-  ungroup()
+  nest() %>%
+  left_join(pff_pocket_ids, by = c("gameId", "playId")) %>%
+  mutate(summary = map2(data, pocket_ids, ~compute_qb_area(.x, .y))) %>%
+  select(gameId, playId, summary) %>%
+  unnest(summary)
 
 
 ```
@@ -346,4 +493,3 @@ ggplot(binned_team_summary, aes(x = avg_neg_change, y = avg_yards)) +
   theme_minimal() +
   guides(color = guide_legend(title = "Outlier Team"))
 ```
-
