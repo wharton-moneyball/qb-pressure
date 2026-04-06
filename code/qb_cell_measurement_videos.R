@@ -199,8 +199,7 @@ render_play <- function(play_row, play_rank) {
               qb_x     = qb_row$x[[1]],
               qb_y     = qb_row$y[[1]],
               play_dir = qb_row$playDirection[[1]],
-              back_cap = this_back_cap,   # dynamic!
-              side_cap = SIDE_CAP_YARDS
+              back_cap = this_back_cap
             )
             
             qb_area <- poly_area(capped$x, capped$y)
@@ -272,8 +271,8 @@ render_play <- function(play_row, play_rank) {
                  this_back_cap, back_cap_range),
          adj = c(0, 1), col = "#ffd966", cex = 0.9)
     text(2.0, 44.7,
-         sprintf("Side cap: %.1f yds  |  T_horizon: %.1fs",
-                 SIDE_CAP_YARDS, T_HORIZON_SEC),
+         sprintf("Semicircle cap (r=back_cap)  |  T_horizon: %.1fs",
+                 T_HORIZON_SEC),
          adj = c(0, 1), col = "#ffd966", cex = 0.9)
     
     legend("bottomleft",
@@ -346,3 +345,4 @@ write_csv(video_rows, file.path(out_dir, "video_manifest.csv"))
 
 message("Done. Combined reel: ", combined_video)
 print(video_rows)
+

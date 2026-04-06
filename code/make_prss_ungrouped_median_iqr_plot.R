@@ -97,16 +97,51 @@ clip_ymax <- function(x, y, ymax) {
   )
 }
 
-clip_qb_polygon <- function(x, y, qb_x, qb_y, play_dir, back_cap, side_cap) {
-  out <- list(x = x, y = y)
-  dir <- tolower(as.character(play_dir))
-  if (is.finite(qb_x) && dir == "right") out <- clip_xmin(out$x, out$y, qb_x - back_cap)
-  if (is.finite(qb_x) && dir == "left")  out <- clip_xmax(out$x, out$y, qb_x + back_cap)
-  if (is.finite(qb_y)) {
-    out <- clip_ymin(out$x, out$y, qb_y - side_cap)
-    out <- clip_ymax(out$x, out$y, qb_y + side_cap)
+make_back_semicircle <- function(cx, cy, r, play_dir, n_pts = 60, far = 200) {
+  dir    <- tolower(as.character(play_dir))
+  if (dir == "right") {
+    thetas <- seq(3*pi/2, pi/2, length.out = n_pts)
+    arc_x  <- cx + r * cos(thetas)
+    arc_y  <- cy + r * sin(thetas)
+    list(x = c(arc_x, cx + far, cx + far),
+         y = c(arc_y, cy + r,   cy - r))
+  } else {
+    thetas <- seq(pi/2, -pi/2, length.out = n_pts)
+    arc_x  <- cx + r * cos(thetas)
+    arc_y  <- cy + r * sin(thetas)
+    list(x = c(arc_x, cx - far, cx - far),
+         y = c(arc_y, cy - r,   cy + r))
+  }
+}
+
+clip_to_convex_polygon <- function(sx, sy, cx, cy) {
+  out <- list(x = sx, y = sy)
+  n   <- length(cx)
+  for (i in seq_len(n)) {
+    j  <- if (i == n) 1L else i + 1L
+    ax <- cx[i]; ay <- cy[i]
+    bx <- cx[j]; by <- cy[j]
+    ex <- bx - ax; ey <- by - ay
+    out <- clip_polygon(out$x, out$y,
+      inside_fn    = function(px, py) (px - ax) * ey - (py - ay) * ex >= 0,
+      intersect_fn = function(x1, y1, x2, y2) {
+        dx <- x2 - x1; dy <- y2 - y1
+        denom <- dx * ey - dy * ex
+        if (abs(denom) < 1e-12) return(c(x1, y1))
+        t <- ((ax - x1) * ey - (ay - y1) * ex) / denom
+        c(x1 + t * dx, y1 + t * dy)
+      }
+    )
+    if (length(out$x) < 3) break
   }
   out
+}
+
+clip_qb_polygon <- function(x, y, qb_x, qb_y, play_dir, back_cap, n_pts = 60) {
+  if (!is.finite(qb_x) || !is.finite(qb_y) || !is.finite(back_cap) || back_cap <= 0)
+    return(list(x = x, y = y))
+  semi <- make_back_semicircle(qb_x, qb_y, back_cap, play_dir, n_pts)
+  clip_to_convex_polygon(x, y, semi$x, semi$y)
 }
 
 pff_pocket_ids <- pff %>%
@@ -174,8 +209,7 @@ get_area_vs_time <- function(game_id, play_id, pocket_ids = NULL) {
         qb_x = qb_seed$x[[1]],
         qb_y = qb_seed$y[[1]],
         play_dir = qb_seed$playDirection[[1]],
-        back_cap = back_cap_yards,
-        side_cap = side_cap_yards
+        back_cap = back_cap_yards
       )
       area <- poly_area(capped$x, capped$y)
       if (!is.finite(area)) return(NULL)
@@ -224,7 +258,7 @@ p <- ggplot(rate_summary, aes(x = second_bin)) +
   annotate("text", x = 0.05, y = Inf, label = "snap", vjust = 1.4, color = "darkgreen", size = 3.5) +
   labs(
     title = "Median Frame-to-Frame Pocket Area Change (Ungrouped)",
-    subtitle = sprintf("Line = median | Band = IQR | Capped QB cell (back=%.1f yd, side=%.1f yd)", back_cap_yards, side_cap_yards),
+    subtitle = sprintf("Line = median | Band = IQR | Semicircle cap (r=%.1f yd)", back_cap_yards),
     x = "Seconds since snap",
     y = "Change in QB area (sq yards / frame)"
   ) +
