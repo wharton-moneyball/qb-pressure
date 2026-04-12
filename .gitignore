@@ -60,3 +60,6 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 data/bdb/pffScoutingData.csv 
+
+# AI
+.claude/worktrees/
